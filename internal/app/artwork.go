@@ -8,6 +8,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"math"
+	"os"
 	"slices"
 	"time"
 	"weak"
@@ -34,8 +35,9 @@ type artwork struct {
 
 // artCache loads covers on goroutines and keeps them, up to artLimit
 // bytes: their pixels on the GPU while they show, and on the CPU only
-// their data, which takes a fraction of the pixels. Its methods run on
-// the main thread; post runs a function there.
+// their data, which takes a fraction of the pixels. Those it loads it
+// keeps on disk too, in dir, unless it is "". Its methods run on the main
+// thread; post runs a function there.
 type artCache struct {
 	art map[string]*artwork
 	// gone are the covers dropped, for as long as something else holds
@@ -43,6 +45,7 @@ type artCache struct {
 	// was rather than loading again.
 	gone     map[string]weak.Pointer[artwork]
 	busy     map[string]bool
+	dir      string
 	fetching chan struct{}
 	decoding chan struct{}
 	post     func(func())
@@ -66,8 +69,8 @@ const (
 	artDecodes = 8
 )
 
-func newArtCache(post func(func())) *artCache {
-	return &artCache{art: map[string]*artwork{}, gone: map[string]weak.Pointer[artwork]{}, busy: map[string]bool{}, fetching: make(chan struct{}, artFetches), decoding: make(chan struct{}, artDecodes), post: post, now: time.Now, limit: artLimit}
+func newArtCache(post func(func()), dir string) *artCache {
+	return &artCache{art: map[string]*artwork{}, gone: map[string]weak.Pointer[artwork]{}, busy: map[string]bool{}, dir: dir, fetching: make(chan struct{}, artFetches), decoding: make(chan struct{}, artDecodes), post: post, now: time.Now, limit: artLimit}
 }
 
 // artRetry is how long a cover that failed to load n times in a row waits
@@ -180,19 +183,34 @@ const artRelease = 2 * time.Second
 // fetchCover fetches a cover from the CDN; tests replace it.
 var fetchCover = netease.Fetch
 
-// load fetches the cover at url, as a bitmap to draw and an image to
-// measure, with the bytes of its data.
+// load reads the cover at url from disk, or fetches it and keeps it there,
+// as a bitmap to draw and an image to measure, with the bytes of its data.
 func (c *artCache) load(url string) (*ui.Bitmap, image.Image, int, error) {
+	path := c.artPath(url)
+	if b, ok := readArt(path); ok {
+		if bmp, img, err := c.decode(b); err == nil {
+			return bmp, img, len(b), nil
+		}
+		os.Remove(path)
+	}
 	c.fetching <- struct{}{}
 	b, err := fetchCover(url)
 	<-c.fetching
 	if err != nil {
 		return nil, nil, 0, err
 	}
+	bmp, img, err := c.decode(b)
+	// Kept only once it decodes: not a page of an error, sent as 200.
+	if err == nil {
+		keepArt(path, b)
+	}
+	return bmp, img, len(b), err
+}
+
+func (c *artCache) decode(b []byte) (*ui.Bitmap, image.Image, error) {
 	c.decoding <- struct{}{}
 	defer func() { <-c.decoding }()
-	bmp, img, err := decodeArt(b)
-	return bmp, img, len(b), err
+	return decodeArt(b)
 }
 
 // decodeArt decodes a cover twice: as a bitmap, which keeps the data to
