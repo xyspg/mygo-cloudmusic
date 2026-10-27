@@ -26,6 +26,8 @@ type artwork struct {
 	backdrop *ui.Bitmap
 	tint     ui.Color // the cover's most vivid color
 	failed   bool
+	fails    int       // how many times in a row it failed to load
+	retry    time.Time // when one that failed loads again
 	used     time.Time // when it was last asked for
 	size     int       // the bytes it keeps: its data, and the backdrop's pixels
 }
@@ -68,6 +70,13 @@ func newArtCache(post func(func())) *artCache {
 	return &artCache{art: map[string]*artwork{}, gone: map[string]weak.Pointer[artwork]{}, busy: map[string]bool{}, fetching: make(chan struct{}, artFetches), decoding: make(chan struct{}, artDecodes), post: post, now: time.Now, limit: artLimit}
 }
 
+// artRetry is how long a cover that failed to load n times in a row waits
+// to load again: a few seconds after a timeout, longer while the network
+// stays away, up to a minute.
+func artRetry(n int) time.Duration {
+	return min(5*time.Second<<min(n-1, 4), time.Minute)
+}
+
 // add keeps a cover, and drops those asked for least recently once the
 // covers take more than the limit, down to three quarters of it, so that
 // it sorts them seldom. Those showing were asked for last, and stay.
@@ -108,18 +117,23 @@ func (c *artCache) get(url string, backdrop bool) *artwork {
 		key += "#backdrop"
 	}
 	now := c.now()
-	if a, ok := c.art[key]; ok {
-		a.used = now
-		return a
+	a, ok := c.art[key]
+	if !ok {
+		// One dropped that something still holds comes back as it was.
+		if a = c.gone[key].Value(); a != nil {
+			delete(c.gone, key)
+			a.used = now
+			c.add(key, a)
+			ok = true
+		}
 	}
-	if a := c.gone[key].Value(); a != nil {
-		delete(c.gone, key)
+	if ok {
 		a.used = now
-		c.add(key, a)
-		return a
 	}
-	if c.busy[key] {
-		return nil
+	// One that failed, to a timeout or the network gone, loads again once
+	// its wait is over, while it shows; until it comes, it stays failed.
+	if ok && (!a.failed || now.Before(a.retry)) || c.busy[key] {
+		return a
 	}
 	c.busy[key] = true
 	go func() {
@@ -135,7 +149,14 @@ func (c *artCache) get(url string, backdrop bool) *artwork {
 		c.post(func() {
 			delete(c.busy, key)
 			if err != nil {
-				c.add(key, &artwork{failed: true, used: c.now()})
+				fails := 1
+				if old := c.art[key]; old != nil && old.failed {
+					fails = old.fails + 1
+				}
+				wait := artRetry(fails)
+				c.add(key, &artwork{failed: true, fails: fails, retry: c.now().Add(wait), used: c.now()})
+				// Drawn again then, a page asks for it again.
+				time.AfterFunc(wait, func() { c.post(func() {}) })
 				return
 			}
 			a := &artwork{bmp: bmp, tint: tint, used: c.now(), size: size}
@@ -149,7 +170,7 @@ func (c *artCache) get(url string, backdrop bool) *artwork {
 			time.AfterFunc(artRelease, func() { mygo.RunOnMain(bmp.ReleasePixels) })
 		})
 	}()
-	return nil
+	return a
 }
 
 // artRelease is how long a cover keeps its pixels once loaded: past the
