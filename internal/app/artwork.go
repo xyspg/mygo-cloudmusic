@@ -39,13 +39,14 @@ type artCache struct {
 	// gone are the covers dropped, for as long as something else holds
 	// them: Now Playing keeps the cover it shows, which comes back as it
 	// was rather than loading again.
-	gone  map[string]weak.Pointer[artwork]
-	busy  map[string]bool
-	sem   chan struct{}
-	post  func(func())
-	now   func() time.Time
-	size  int // the bytes the covers in art keep
-	limit int
+	gone     map[string]weak.Pointer[artwork]
+	busy     map[string]bool
+	fetching chan struct{}
+	decoding chan struct{}
+	post     func(func())
+	now      func() time.Time
+	size     int // the bytes the covers in art keep
+	limit    int
 }
 
 // artLimit is how many bytes of covers the cache keeps. A cover keeps its
@@ -54,8 +55,17 @@ type artCache struct {
 // however long ago it showed them, rather than loading them again.
 const artLimit = 64 << 20
 
+// How many covers fetch at once, and how many decode. They come over one
+// HTTP/2 connection to the CDN, which takes 128 at once, each a round trip
+// that is most of a second far from it: 8 at once, as decoding is, took
+// the wall's 40 covers 3 seconds in five rounds, where 32 take one.
+const (
+	artFetches = 32
+	artDecodes = 8
+)
+
 func newArtCache(post func(func())) *artCache {
-	return &artCache{art: map[string]*artwork{}, gone: map[string]weak.Pointer[artwork]{}, busy: map[string]bool{}, sem: make(chan struct{}, 8), post: post, now: time.Now, limit: artLimit}
+	return &artCache{art: map[string]*artwork{}, gone: map[string]weak.Pointer[artwork]{}, busy: map[string]bool{}, fetching: make(chan struct{}, artFetches), decoding: make(chan struct{}, artDecodes), post: post, now: time.Now, limit: artLimit}
 }
 
 // add keeps a cover, and drops those asked for least recently once the
@@ -113,9 +123,7 @@ func (c *artCache) get(url string, backdrop bool) *artwork {
 	}
 	c.busy[key] = true
 	go func() {
-		c.sem <- struct{}{}
-		bmp, img, size, err := loadArt(url)
-		<-c.sem
+		bmp, img, size, err := c.load(url)
 		var blurred *image.RGBA
 		var tint ui.Color
 		if err == nil {
@@ -148,13 +156,20 @@ func (c *artCache) get(url string, backdrop bool) *artwork {
 // frame that first shows it, and the smaller copies it shows from there.
 const artRelease = 2 * time.Second
 
-// loadArt fetches the cover at url, as a bitmap to draw and an image to
+// fetchCover fetches a cover from the CDN; tests replace it.
+var fetchCover = netease.Fetch
+
+// load fetches the cover at url, as a bitmap to draw and an image to
 // measure, with the bytes of its data.
-func loadArt(url string) (*ui.Bitmap, image.Image, int, error) {
-	b, err := netease.Fetch(url)
+func (c *artCache) load(url string) (*ui.Bitmap, image.Image, int, error) {
+	c.fetching <- struct{}{}
+	b, err := fetchCover(url)
+	<-c.fetching
 	if err != nil {
 		return nil, nil, 0, err
 	}
+	c.decoding <- struct{}{}
+	defer func() { <-c.decoding }()
 	bmp, img, err := decodeArt(b)
 	return bmp, img, len(b), err
 }

@@ -1,8 +1,10 @@
 package app
 
 import (
+	"errors"
 	"os"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -58,6 +60,8 @@ func TestArtCacheKeepsCoversUnderLimit(t *testing.T) {
 	c.now = func() time.Time { return now }
 	page := &artwork{used: now, size: 100 << 10}
 	c.add("page", page)
+	// Kept too, so that asking for it fetches nothing.
+	c.add("other", &artwork{used: now})
 	for range 60 {
 		now = now.Add(time.Minute)
 		c.get("other", false)
@@ -87,4 +91,30 @@ func TestArtCacheKeepsHeldCovers(t *testing.T) {
 		t.Error("loaded again a cover something still held")
 	}
 	runtime.KeepAlive(held)
+}
+
+// The covers a page shows fetch together, not 8 at a time as they decode:
+// far from the CDN each is a round trip most of a second long, and the
+// wall's 40 took 3 seconds in rounds of 8.
+func TestArtCacheFetchesCoversTogether(t *testing.T) {
+	const n = 20
+	started, release := make(chan struct{}, n), make(chan struct{})
+	defer func(f func(string) ([]byte, error)) { fetchCover = f }(fetchCover)
+	fetchCover = func(string) ([]byte, error) {
+		started <- struct{}{}
+		<-release
+		return nil, errors.New("offline")
+	}
+	defer close(release)
+	c := newArtCache(func(func()) {})
+	for i := range n {
+		c.get(strconv.Itoa(i), false)
+	}
+	for i := range n {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%d of %d covers fetching at once", i, n)
+		}
+	}
 }
